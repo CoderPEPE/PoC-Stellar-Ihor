@@ -1,0 +1,34 @@
+{
+  "name": "proof-anchoring-stellar",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Standalone POC: idempotent, reset-resilient proof-hash anchoring on Stellar TESTNET via MemoHash.",
+  "scripts": {
+    "build": "tsc --noEmit",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:testnet": "RUN_TESTNET=1 vitest run test/testnet.integration.test.ts",
+    "demo": "tsx src/index.ts",
+    "run:testnet": "tsx src/run.ts",
+    "start": "yarn build && yarn test && yarn test:testnet && yarn run:testnet"
+  },
+  "dependencies": {
+    "@stellar/stellar-sdk": "^13.1.0",
+    "better-sqlite3": "^11.8.1"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.12",
+    "@types/node": "^22.10.5",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.3",
+    "vitest": "^2.1.8"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "better-sqlite3",
+      "esbuild"
+    ]
+  }
+}
