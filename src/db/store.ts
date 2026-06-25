@@ -45,6 +45,12 @@ export interface Store {
   setSequence(accountId: string, nextSequence: string): void;
   /** Atomically reserve and return the next tx sequence number for an account. */
   reserveSequence(accountId: string): string;
+  /**
+   * Highest sequence number still held by a LIVE (pending/submitted) attempt on this
+   * account, or null if none. An on-chain resync must never reset BELOW this, or it
+   * would reissue a sequence a concurrent in-flight tx already reserved.
+   */
+  maxInFlightSequence(accountId: string): string | null;
 
   close(): void;
 }
@@ -389,6 +395,22 @@ export class SqliteStore implements Store {
       return reserved.toString();
     });
     return txn(accountId);
+  }
+
+  maxInFlightSequence(accountId: string): string | null {
+    // i64 sequence numbers are stored as text; compare with BigInt, not SQLite MAX.
+    const rows = this.db
+      .prepare(
+        `SELECT sequence_number FROM anchor_attempts
+           WHERE source_account = ? AND status IN ('pending', 'submitted')`,
+      )
+      .all(accountId) as { sequence_number: string }[];
+    let max: bigint | null = null;
+    for (const { sequence_number } of rows) {
+      const s = BigInt(sequence_number);
+      if (max === null || s > max) max = s;
+    }
+    return max === null ? null : max.toString();
   }
 
   close(): void {

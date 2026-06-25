@@ -14,20 +14,47 @@
  * The first run prints a STELLAR_SECRET to set so subsequent runs reuse the account.
  */
 import { createHash } from 'node:crypto';
+import { existsSync, readFileSync, statSync } from 'node:fs';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { Keypair } from '@stellar/stellar-sdk';
 import { AnchorService } from './anchorService.js';
 import { loadConfig } from './config.js';
 import { SqliteStore } from './db/store.js';
-import { deriveClientTxId } from './idempotency.js';
+import { assertValidProofHash, deriveClientTxId } from './idempotency.js';
+import { SequenceAllocator } from './stellar/sequence.js';
 import { RealHorizonClient } from './stellar/horizonReal.js';
 import { AnchorStatus } from './types.js';
 import type { PublicReceipt } from './verify.js';
 
 const FRIENDBOT = 'https://friendbot.stellar.org';
+const DEFAULT_SUBJECT = 'samples/demo-document.txt'; // a real file that ships with the repo
 
-function sha256Hex(input: string): string {
+function sha256Hex(input: string | Buffer): string {
   return createHash('sha256').update(input).digest('hex');
+}
+
+/**
+ * The proof hash to anchor. A proof hash must be the sha256 of real CONTENT — never of
+ * a filename. Precedence:
+ *   1. `--hash <64-hex>`  — an explicit, precomputed content hash
+ *   2. `<subject>` is a file on disk — sha256 of its actual bytes
+ *   3. otherwise — error (refuse to anchor a hash of the filename string)
+ */
+function resolveProofHash(subject: string, argv: string[]): string {
+  const i = argv.indexOf('--hash');
+  const flag = argv.find((a) => a.startsWith('--hash='))?.slice(7) ?? (i >= 0 ? argv[i + 1] : undefined);
+  if (flag) {
+    const hex = flag.toLowerCase();
+    assertValidProofHash(hex); // throws on anything but 64 hex chars
+    return hex;
+  }
+  if (existsSync(subject) && statSync(subject).isFile()) {
+    return sha256Hex(readFileSync(subject)); // hash the real file bytes
+  }
+  throw new Error(
+    `"${subject}" is not a file on disk. Pass a real file path, or an explicit ` +
+      `precomputed hash via --hash <64-hex>. (We never hash the filename itself.)`,
+  );
 }
 
 function assert(cond: unknown, message: string): asserts cond {
@@ -81,8 +108,9 @@ async function main(): Promise<void> {
   // The runner always uses a real file (the service defaults to :memory: for tests).
   const dbPath = config.dbPath === ':memory:' ? 'data/anchors.db' : config.dbPath;
 
-  const subject = process.argv[2] && !process.argv[2].startsWith('--') ? process.argv[2] : 'demo-document.pdf';
+  const subject = process.argv[2] && !process.argv[2].startsWith('--') ? process.argv[2] : DEFAULT_SUBJECT;
   const doReanchor = process.argv.includes('--reanchor');
+  const proofHash = resolveProofHash(subject, process.argv.slice(2));
 
   const horizon = new RealHorizonClient(config.horizonUrl, config.networkPassphrase);
 
@@ -97,14 +125,15 @@ async function main(): Promise<void> {
   const account = await ensureFunded(horizon, keypair.publicKey());
 
   const store = new SqliteStore(dbPath);
-  // Register the account, then HARD-SYNC the allocator to the on-chain sequence — the
-  // chain is the truth, especially across restarts with a persisted DB.
-  store.initAccount(keypair.publicKey(), (BigInt(account.sequence) + 1n).toString());
-  store.setSequence(keypair.publicKey(), (BigInt(account.sequence) + 1n).toString());
+  const onChainNext = BigInt(account.sequence) + 1n;
+  // Register the account, then sync the allocator to the on-chain sequence — the chain is
+  // the truth across restarts — but never below a sequence a prior run left in flight
+  // (resetToChain guards that, so we don't reissue an unsettled tx's reserved sequence).
+  store.initAccount(keypair.publicKey(), onChainNext.toString());
+  new SequenceAllocator(store).resetToChain(keypair.publicKey(), onChainNext);
 
   const service = new AnchorService({ store, horizon, keypair, config });
 
-  const proofHash = sha256Hex(subject);
   console.log('━'.repeat(72));
   console.log(`DB:       ${dbPath}`);
   console.log(`Account:  ${keypair.publicKey()}`);

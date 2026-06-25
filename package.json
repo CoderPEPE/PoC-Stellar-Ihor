@@ -12,7 +12,7 @@
     "test:testnet": "RUN_TESTNET=1 vitest run test/testnet.integration.test.ts",
     "demo": "tsx src/index.ts",
     "run:testnet": "tsx src/run.ts",
-    "start": "yarn build && yarn test && yarn test:testnet && yarn run:testnet"
+    "start": "pnpm build && pnpm test && pnpm test:testnet && pnpm run:testnet"
   },
   "dependencies": {
     "@stellar/stellar-sdk": "^13.1.0",
@@ -26,9 +26,6 @@
     "vitest": "^2.1.8"
   },
   "pnpm": {
-    "onlyBuiltDependencies": [
-      "better-sqlite3",
-      "esbuild"
-    ]
+    "onlyBuiltDependencies": ["better-sqlite3", "esbuild"]
   }
 }

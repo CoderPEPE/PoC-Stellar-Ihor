@@ -610,4 +610,91 @@ describe('AnchorService', () => {
       expect(seqs[i]! - seqs[i - 1]!).toBe(1n); // each exactly one greater
     }
   });
+
+  it('28. re-anchor that times out then confirms via retry supersedes the parent LATE', async () => {
+    const { service, horizon, store } = setup(() => 1000);
+    horizon.submitHandler = async (xdr) => ({ hash: hash(xdr), ledger: 10, successful: true });
+    const proofHash = hash('p28');
+
+    // gen 0 is confirmed and live.
+    const v0 = await service.anchor({ proofId: 'p28', proofHash });
+    expect(v0.status).toBe(AnchorStatus.Confirmed);
+
+    // Re-anchor, but the child's submission TIMES OUT — it stays in-flight, NOT confirmed.
+    horizon.submitHandler = async () => {
+      throw transportError('ETIMEDOUT');
+    };
+    const child = await service.reanchor(v0.anchorId, 'manual re-anchor via run.ts');
+    expect(child.anchorGeneration).toBe(1);
+    expect(child.status).not.toBe(AnchorStatus.Confirmed);
+    // Parent is still the live receipt — never retired for a child that hasn't landed.
+    expect(store.getAnchor(v0.anchorId)!.status).toBe(AnchorStatus.Confirmed);
+
+    // The child's tx actually landed; a later retry reconciles it WITHOUT resubmitting.
+    const childTxHash = store.getAttempt(child.activeAttemptId!)!.txHash!;
+    const submitsBefore = horizon.submitCalls;
+    horizon.getTransactionHandler = async (h) =>
+      h === childTxHash
+        ? {
+            hash: childTxHash,
+            ledger: 888,
+            successful: true,
+            memoType: 'hash',
+            memoHashHex: proofHash,
+            createdAt: 'now',
+          }
+        : null;
+
+    const confirmedChild = await service.retry(child.anchorId);
+    expect(confirmedChild.status).toBe(AnchorStatus.Confirmed);
+    expect(confirmedChild.ledgerSeq).toBe(888);
+    expect(horizon.submitCalls).toBe(submitsBefore); // reconciled, not resubmitted
+
+    // THE POINT: the parent must now be superseded, even though the child confirmed LATE.
+    const v0After = store.getAnchor(v0.anchorId)!;
+    expect(v0After.status).toBe(AnchorStatus.Superseded);
+    expect(v0After.receiptJson).toBeTruthy(); // receipt preserved (append-only)
+    expect(v0After.ledgerSeq).toBe(10); // …only the status flipped
+    expect(service.lineage(proofHash).map((r) => r.status)).toEqual(['superseded', 'anchored']);
+  });
+
+  it('29. resync never reissues a sequence still held by a LIVE in-flight attempt', async () => {
+    let clock = 1000;
+    const { service, horizon, store, keypair } = setup(() => clock);
+    horizon.submitHandler = async () => {
+      throw transportError('ETIMEDOUT'); // everything stays in-flight ('submitted')
+    };
+
+    // B anchors at the first sequence and stays live (in-flight, never settled).
+    const b = await service.anchor({ proofId: 'p29b', proofHash: hash('p29b') });
+    const bAttempt = store.getAttempt(b.activeAttemptId!)!;
+    expect(bAttempt.status).toBe('submitted');
+
+    // A anchors at the next sequence, also in-flight.
+    const a = await service.anchor({ proofId: 'p29a', proofHash: hash('p29a') });
+    const aFirst = store.getAttempt(a.activeAttemptId!)!;
+    expect(BigInt(aFirst.sequenceNumber)).toBe(BigInt(bAttempt.sequenceNumber) + 1n);
+
+    // A expires and is retried → it REBUILDS, which resyncs from chain. The chain still
+    // reports a sequence BELOW B's (nothing has applied yet). A naïve reset to
+    // account.sequence+1 would hand A the SAME sequence B is still holding → collision.
+    clock = aFirst.maxTime + 10;
+    horizon.getTransactionHandler = async () => null;
+    horizon.getAccountHandler = async () => ({
+      accountId: keypair.publicKey(),
+      sequence: (BigInt(bAttempt.sequenceNumber) - 1n).toString(),
+    });
+    horizon.submitHandler = async (xdr) =>
+      xdr === aFirst.txXdr
+        ? Promise.reject(resultCodeError('tx_too_late')) // old envelope expired
+        : { hash: hash(xdr), ledger: 700, successful: true }; // rebuilt one works
+
+    const aRetried = await service.retry(a.anchorId);
+    const aRebuilt = store.getAttempt(aRetried.activeAttemptId!)!;
+
+    // The rebuilt sequence must skip PAST B's live, in-flight sequence — not reissue it.
+    expect(aRebuilt.sequenceNumber).not.toBe(bAttempt.sequenceNumber);
+    expect(BigInt(aRebuilt.sequenceNumber)).toBe(BigInt(bAttempt.sequenceNumber) + 1n);
+    expect(store.getAttempt(b.activeAttemptId!)!.status).toBe('submitted'); // B untouched
+  });
 });

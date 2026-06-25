@@ -222,6 +222,7 @@ export class AnchorService {
         receiptJson: JSON.stringify(txRecord),
         errorClass: null,
       });
+      this.supersedeParentOf(anchor); // a re-anchor confirming late still retires its parent
       return this.store.getAnchor(anchorId)!;
     }
 
@@ -272,22 +273,31 @@ export class AnchorService {
       );
     }
 
-    const child = await this.anchor({
+    // The parent is superseded at the child's confirm transition (see supersedeParentOf),
+    // NOT here — so it works whether the child confirms now, synchronously, or later via
+    // retry/reconcile after this submission timed out. Until then the parent stays the
+    // live receipt; never retire a live receipt for a generation that doesn't exist yet.
+    return this.anchor({
       proofId: parent.proofId,
       proofHash: parent.proofHash,
       generation: parent.anchorGeneration + 1,
       parentAnchorId: parent.anchorId,
       reason,
     });
+  }
 
-    // Supersede the parent ONLY once the new generation is itself confirmed on-chain.
-    // If the child did not confirm, leave the parent active — never retire a live
-    // receipt in favour of one that does not exist yet. (The prior receipt is never
-    // overwritten regardless; only its status flips.)
-    if (child.status === AnchorStatus.Confirmed) {
+  /**
+   * Retire a confirmed parent once its re-anchored child confirms. Lives at the confirm
+   * transition (submit success or reconcile), so a child that confirms LATE — via
+   * retry/reconcile after a timed-out re-anchor — still supersedes its parent. Only a
+   * live (confirmed) parent is flipped; its receipt is preserved, only the status changes.
+   */
+  private supersedeParentOf(anchor: AnchorRecord): void {
+    if (!anchor.parentAnchorId) return;
+    const parent = this.store.getAnchor(anchor.parentAnchorId);
+    if (parent?.status === AnchorStatus.Confirmed) {
       this.store.updateAnchor(parent.anchorId, { status: AnchorStatus.Superseded });
     }
-    return child;
   }
 
   /** The public verification view for a single anchor. */
@@ -399,7 +409,7 @@ export class AnchorService {
     const accountId = this.keypair.publicKey();
     const account = await this.horizon.getAccount(accountId);
     if (account === null) throw new AccountVanished(accountId);
-    this.sequences.reset(accountId, (BigInt(account.sequence) + 1n).toString());
+    this.sequences.resetToChain(accountId, BigInt(account.sequence) + 1n);
   }
 
   private async submitAttempt(
@@ -437,6 +447,7 @@ export class AnchorService {
         receiptJson: JSON.stringify(res),
         errorClass: null,
       });
+      this.supersedeParentOf(anchor); // re-anchor confirming synchronously retires its parent
       return { ok: true, errorClass: null };
     } catch (err) {
       const klass = classifyError(err);

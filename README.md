@@ -196,6 +196,12 @@ first — the unapplied sequence is reused, not skipped, so no gap is created. B
 (the original may have applied), so the rebuild path **re-reconciles before rebuilding** to
 avoid a duplicate.
 
+One guard on that reset: it never drops **below a sequence still held by a live
+(`pending`/`submitted`) attempt** on the same account (`resetToChain` →
+`maxInFlightSequence`). Otherwise a resync racing a concurrent in-flight attempt could
+hand both the same number. The dead envelope being rebuilt is already `expired`/`failed`,
+so it is excluded — its sequence is still reclaimed whenever nothing live sits above it.
+
 ### Receipt lineage
 
 Receipts are append-only. A re-anchor never overwrites history — it's a new immutable
@@ -263,9 +269,14 @@ pnpm start            # the whole gamut: typecheck → mocked → live suite →
 RUN_TESTNET=1 pnpm test:testnet
 
 # Full end-to-end run against live TESTNET, persisted to a real SQLite file:
-pnpm run:testnet "contract-v1.pdf"              # anchor + prove idempotency + verify on-chain
-pnpm run:testnet "contract-v1.pdf" --reanchor   # also append the next generation
+pnpm run:testnet                                # anchors sha256(samples/demo-document.txt)
+pnpm run:testnet ./path/to/contract.pdf         # anchors sha256 of THAT file's bytes
+pnpm run:testnet --hash <64-hex>                # anchors a precomputed content hash
+pnpm run:testnet ./path/to/contract.pdf --reanchor   # also append the next generation
 ```
+
+> The runner hashes real file **bytes** (or an explicit `--hash`), never the filename — a
+> path that isn't a file on disk errors out rather than anchoring a meaningless hash.
 
 **`pnpm run:testnet`** is the headline end-to-end: it funds an account, anchors through the
 **real** service path, proves idempotency, optionally re-anchors, then independently reads

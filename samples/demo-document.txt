@@ -1,0 +1,6 @@
+Proof-Anchoring-Stellar — demo document.
+
+These bytes stand in for a real document (a PDF, a contract, an image …). The runner
+anchors sha256(THIS FILE'S BYTES) — not the filename — as a MemoHash on Stellar TESTNET.
+
+Edit this file and the proof hash changes; that is the whole point of a content hash.

@@ -32,7 +32,9 @@ async function main(): Promise<void> {
   store.initAccount(keypair.publicKey(), '1');
   const service = new AnchorService({ store, horizon, keypair, config });
 
-  const proofHash = sha256Hex('contract-v1.pdf');
+  // A stand-in 32-byte content hash for the offline demo. In a real flow this is
+  // sha256 of the document's BYTES (see run.ts), never of its filename.
+  const proofHash = sha256Hex('demo proof content v1');
   console.log('Proof hash:', proofHash);
   console.log('Anchoring account:', keypair.publicKey(), '\n');
 

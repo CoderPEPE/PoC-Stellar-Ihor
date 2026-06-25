@@ -7,13 +7,8 @@ dist/
 *.sqlite3
 data/
 .env
+.env.*
+!.env.example
 .DS_Store
-
-# Yarn Berry / Plug'n'Play (leftovers if switching Yarn versions)
-.pnp.*
-.yarn/*
-!.yarn/patches
-!.yarn/plugins
-!.yarn/releases
-!.yarn/sdks
-!.yarn/versions
+*.log
+coverage/
