@@ -9,7 +9,7 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
-    "test:testnet": "RUN_TESTNET=1 vitest run test/testnet.integration.test.ts",
+    "test:testnet": "cross-env RUN_TESTNET=1 vitest run test/testnet.integration.test.ts",
     "demo": "tsx src/index.ts",
     "run:testnet": "tsx src/run.ts",
     "start": "pnpm build && pnpm test && pnpm test:testnet && pnpm run:testnet"
@@ -21,11 +21,15 @@
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.12",
     "@types/node": "^22.10.5",
+    "cross-env": "^10.1.0",
     "tsx": "^4.19.2",
     "typescript": "^5.7.3",
     "vitest": "^2.1.8"
   },
   "pnpm": {
-    "onlyBuiltDependencies": ["better-sqlite3", "esbuild"]
+    "onlyBuiltDependencies": [
+      "better-sqlite3",
+      "esbuild"
+    ]
   }
 }

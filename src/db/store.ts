@@ -52,6 +52,30 @@ export interface Store {
    */
   maxInFlightSequence(accountId: string): string | null;
 
+  /**
+   * Atomically confirm a child anchor AND supersede its parent (if any) in one
+   * SQLite transaction. If the process crashes after COMMIT, both effects are
+   * durable; if it crashes before COMMIT, neither is visible. The parent UPDATE
+   * uses `WHERE status='confirmed'` so it is idempotent — a second call that
+   * raced with a concurrent supersede is harmless.
+   */
+  confirmAndSupersede(
+    childId: string,
+    parentId: string | null,
+    ledgerSeq: number,
+    receiptJson: string,
+    confirmedAt: string,
+  ): void;
+
+  /**
+   * Atomically re-sync the sequence allocator to max(onChainNext, maxInFlight+1)
+   * AND reserve the next sequence number, all inside one SQLite transaction.
+   * This closes the window between resetToChain's SELECT (maxInFlightSequence)
+   * and its UPDATE (setSequence) so a concurrent worker cannot observe an
+   * inconsistent allocator floor.
+   */
+  syncThenReserve(accountId: string, onChainNext: bigint): string;
+
   close(): void;
 }
 
@@ -411,6 +435,62 @@ export class SqliteStore implements Store {
       if (max === null || s > max) max = s;
     }
     return max === null ? null : max.toString();
+  }
+
+  confirmAndSupersede(
+    childId: string,
+    parentId: string | null,
+    ledgerSeq: number,
+    receiptJson: string,
+    confirmedAt: string,
+  ): void {
+    const txn = this.db.transaction(
+      (cId: string, pId: string | null, ls: number, rj: string, ca: string): void => {
+        this.db
+          .prepare(
+            `UPDATE anchors SET status='confirmed', ledger_seq=?, receipt_json=?,
+                confirmed_at=?, error_class=NULL WHERE anchor_id=?`,
+          )
+          .run(ls, rj, ca, cId);
+        if (pId !== null) {
+          this.db
+            .prepare(
+              `UPDATE anchors SET status='superseded'
+                 WHERE anchor_id=? AND status='confirmed'`,
+            )
+            .run(pId);
+        }
+      },
+    );
+    txn(childId, parentId, ledgerSeq, receiptJson, confirmedAt);
+  }
+
+  syncThenReserve(accountId: string, onChainNext: bigint): string {
+    const txn = this.db.transaction((id: string, chainNext: string): string => {
+      const rows = this.db
+        .prepare(
+          `SELECT sequence_number FROM anchor_attempts
+             WHERE source_account = ? AND status IN ('pending', 'submitted')`,
+        )
+        .all(id) as { sequence_number: string }[];
+      let maxLive: bigint | null = null;
+      for (const { sequence_number } of rows) {
+        const s = BigInt(sequence_number);
+        if (maxLive === null || s > maxLive) maxLive = s;
+      }
+      const chain = BigInt(chainNext);
+      const floor = maxLive !== null && maxLive + 1n > chain ? maxLive + 1n : chain;
+      const reserved = floor;
+      const next = (reserved + 1n).toString();
+      this.db
+        .prepare(
+          `INSERT INTO source_accounts (account_id, next_sequence) VALUES (?, ?)
+           ON CONFLICT (account_id) DO UPDATE SET next_sequence = ?`,
+        )
+        .run(id, next, next);
+      return reserved.toString();
+    });
+    return txn(accountId, onChainNext.toString());
   }
 
   close(): void {

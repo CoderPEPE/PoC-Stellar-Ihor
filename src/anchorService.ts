@@ -13,6 +13,7 @@ import {
   type AnchorInput,
   type AnchorRecord,
   type AttemptRecord,
+  type ConfirmationReceipt,
 } from './types.js';
 import { buildPublicReceipt, type PublicReceipt } from './verify.js';
 
@@ -117,6 +118,15 @@ export class AnchorService {
     let anchor = this.store.getAnchor(anchorId);
     if (!anchor) throw new Error(`Unknown anchor: ${anchorId}`);
 
+    // Idempotent repair: heal torn parent-supersede state from data created
+    // before confirmAndSupersede was introduced (defense-in-depth).
+    if (anchor.status === AnchorStatus.Confirmed && anchor.parentAnchorId) {
+      const parent = this.store.getAnchor(anchor.parentAnchorId);
+      if (parent?.status === AnchorStatus.Confirmed) {
+        this.store.updateAnchor(parent.anchorId, { status: AnchorStatus.Superseded });
+      }
+    }
+
     if (anchor.status === AnchorStatus.Confirmed) return anchor;
     // Integrity faults and reset events are terminal here: do not auto-retry.
     if (anchor.errorClass === ErrorClass.ProofMismatch) return anchor;
@@ -215,14 +225,19 @@ export class AnchorService {
         return this.store.getAnchor(anchorId)!;
       }
       this.store.updateAttempt(attempt.attemptId, { status: 'confirmed' });
-      this.store.updateAnchor(anchorId, {
-        status: AnchorStatus.Confirmed,
+      const receipt: ConfirmationReceipt = {
+        txHash: txRecord.hash,
         ledgerSeq: txRecord.ledger,
-        confirmedAt: this.nowIso(),
-        receiptJson: JSON.stringify(txRecord),
-        errorClass: null,
-      });
-      this.supersedeParentOf(anchor); // a re-anchor confirming late still retires its parent
+        confirmedAt: txRecord.createdAt,
+        memoHashHex: txRecord.memoHashHex ?? anchor.proofHash,
+      };
+      this.store.confirmAndSupersede(
+        anchor.anchorId,
+        anchor.parentAnchorId,
+        receipt.ledgerSeq,
+        JSON.stringify(receipt),
+        receipt.confirmedAt,
+      );
       return this.store.getAnchor(anchorId)!;
     }
 
@@ -286,20 +301,6 @@ export class AnchorService {
     });
   }
 
-  /**
-   * Retire a confirmed parent once its re-anchored child confirms. Lives at the confirm
-   * transition (submit success or reconcile), so a child that confirms LATE — via
-   * retry/reconcile after a timed-out re-anchor — still supersedes its parent. Only a
-   * live (confirmed) parent is flipped; its receipt is preserved, only the status changes.
-   */
-  private supersedeParentOf(anchor: AnchorRecord): void {
-    if (!anchor.parentAnchorId) return;
-    const parent = this.store.getAnchor(anchor.parentAnchorId);
-    if (parent?.status === AnchorStatus.Confirmed) {
-      this.store.updateAnchor(parent.anchorId, { status: AnchorStatus.Superseded });
-    }
-  }
-
   /** The public verification view for a single anchor. */
   publicReceipt(anchorId: string): PublicReceipt {
     const anchor = this.store.getAnchor(anchorId);
@@ -340,10 +341,14 @@ export class AnchorService {
     opts: { resync?: boolean } = {},
   ): Promise<void> {
     // --- network phase (no claim held) -------------------------------------
-    const needSeed = !this.store.hasAccount(this.keypair.publicKey());
+    const accountId = this.keypair.publicKey();
+    const needSeed = !this.store.hasAccount(accountId);
+    let onChainNext: bigint | null = null;
     if (needSeed || opts.resync) {
       try {
-        await this.syncSequenceFromChain();
+        const account = await this.horizon.getAccount(accountId);
+        if (account === null) throw new AccountVanished(accountId);
+        onChainNext = BigInt(account.sequence) + 1n;
       } catch (err) {
         if (err instanceof AccountVanished) {
           this.store.updateAnchor(anchor.anchorId, {
@@ -361,7 +366,10 @@ export class AnchorService {
     }
 
     // --- synchronous phase: reserve → build → atomically claim + insert -----
-    const txSequence = this.sequences.reserve(this.keypair.publicKey());
+    const txSequence =
+      onChainNext !== null
+        ? this.sequences.syncThenReserve(accountId, onChainNext)
+        : this.sequences.reserve(accountId);
     const minTime = 0;
     const maxTime = this.now() + this.config.anchorTtlSeconds;
 
@@ -400,18 +408,6 @@ export class AnchorService {
     await this.submitAttempt(this.store.getAnchor(anchor.anchorId)!, attempt);
   }
 
-  /**
-   * Re-sync the sequence allocator to the account's current on-chain sequence. A
-   * prior envelope that never applied (tx_too_late / tx_bad_seq) left the allocator
-   * ahead of the account; rebuilding without this would itself fail with tx_bad_seq.
-   */
-  private async syncSequenceFromChain(): Promise<void> {
-    const accountId = this.keypair.publicKey();
-    const account = await this.horizon.getAccount(accountId);
-    if (account === null) throw new AccountVanished(accountId);
-    this.sequences.resetToChain(accountId, BigInt(account.sequence) + 1n);
-  }
-
   private async submitAttempt(
     anchor: AnchorRecord,
     attempt: AttemptRecord,
@@ -440,14 +436,19 @@ export class AnchorService {
         return { ok: false, errorClass: ErrorClass.Unknown };
       }
       this.store.updateAttempt(attempt.attemptId, { status: 'confirmed' });
-      this.store.updateAnchor(anchor.anchorId, {
-        status: AnchorStatus.Confirmed,
+      const receipt: ConfirmationReceipt = {
+        txHash: res.hash,
         ledgerSeq: res.ledger,
         confirmedAt: this.nowIso(),
-        receiptJson: JSON.stringify(res),
-        errorClass: null,
-      });
-      this.supersedeParentOf(anchor); // re-anchor confirming synchronously retires its parent
+        memoHashHex: anchor.proofHash,
+      };
+      this.store.confirmAndSupersede(
+        anchor.anchorId,
+        anchor.parentAnchorId,
+        receipt.ledgerSeq,
+        JSON.stringify(receipt),
+        receipt.confirmedAt,
+      );
       return { ok: true, errorClass: null };
     } catch (err) {
       const klass = classifyError(err);

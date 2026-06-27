@@ -34,4 +34,13 @@ export class SequenceAllocator {
   reserve(accountId: string): string {
     return this.store.reserveSequence(accountId);
   }
+
+  /**
+   * Atomically reset the allocator to max(onChainNext, maxInFlight+1) and reserve
+   * the next sequence. Replaces the old two-step syncSequenceFromChain + reserve
+   * pattern, closing the concurrency gap between resetToChain's SELECT and UPDATE.
+   */
+  syncThenReserve(accountId: string, onChainNext: bigint): string {
+    return this.store.syncThenReserve(accountId, onChainNext);
+  }
 }

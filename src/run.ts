@@ -57,6 +57,25 @@ function resolveProofHash(subject: string, argv: string[]): string {
   );
 }
 
+/**
+ * Resolve the proof identity string stored in the database lineage. In file mode
+ * the subject path IS the proofId. In explicit hash mode the caller must supply
+ * `--proof-id <name>` — the demo-file fallback would be semantically misleading.
+ */
+function resolveProofId(argv: string[], subject: string, isHashMode: boolean): string {
+  const i = argv.indexOf('--proof-id');
+  const flag = argv.find((a) => a.startsWith('--proof-id='))?.slice(11) ?? (i >= 0 ? argv[i + 1] : undefined);
+  if (flag) return flag;
+  if (isHashMode) {
+    throw new Error(
+      'In --hash mode you must supply --proof-id <name> so the lineage records\n' +
+        '  what this proof represents (the subject path is not available).\n' +
+        '  Example: --hash abc123... --proof-id "contract-v2.pdf"',
+    );
+  }
+  return subject;
+}
+
 function assert(cond: unknown, message: string): asserts cond {
   if (!cond) throw new Error(`CHECK FAILED: ${message}`);
 }
@@ -110,7 +129,10 @@ async function main(): Promise<void> {
 
   const subject = process.argv[2] && !process.argv[2].startsWith('--') ? process.argv[2] : DEFAULT_SUBJECT;
   const doReanchor = process.argv.includes('--reanchor');
-  const proofHash = resolveProofHash(subject, process.argv.slice(2));
+  const argv = process.argv.slice(2);
+  const proofHash = resolveProofHash(subject, argv);
+  const isHashMode = argv.includes('--hash') || argv.some((a) => a.startsWith('--hash='));
+  const proofId = resolveProofId(argv, subject, isHashMode);
 
   const horizon = new RealHorizonClient(config.horizonUrl, config.networkPassphrase);
 
@@ -138,6 +160,7 @@ async function main(): Promise<void> {
   console.log(`DB:       ${dbPath}`);
   console.log(`Account:  ${keypair.publicKey()}`);
   console.log(`Subject:  "${subject}"`);
+  console.log(`ProofId:  "${proofId}"`);
   console.log(`Proof:    ${proofHash}`);
   console.log('━'.repeat(72));
 
@@ -147,14 +170,14 @@ async function main(): Promise<void> {
 
   // 1. Anchor (or return the existing record).
   console.log(preexisting ? '\n[1] Proof already anchored in this DB — expecting idempotent return:' : '\n[1] Anchoring proof:');
-  const v0 = await service.anchor({ proofId: subject, proofHash });
+  const v0 = await service.anchor({ proofId, proofHash });
   assert(v0.status === AnchorStatus.Confirmed, `expected confirmed, got ${v0.status} (${v0.errorClass})`);
   printReceipt('v0', service.publicReceipt(v0.anchorId));
 
   // 2. Idempotency: a second call must return the SAME anchor and issue no new tx.
   console.log('\n[2] Idempotent repeat (same call again):');
   const v0TxBefore = store.getAttempt(v0.activeAttemptId!)!.txHash;
-  const again = await service.anchor({ proofId: subject, proofHash });
+  const again = await service.anchor({ proofId, proofHash });
   assert(again.anchorId === v0.anchorId, 'repeat returned a different anchor id');
   assert(again.activeAttemptId === v0.activeAttemptId, 'repeat created a new attempt');
   assert(store.getAttempt(again.activeAttemptId!)!.txHash === v0TxBefore, 'repeat changed the tx');

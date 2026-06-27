@@ -98,6 +98,18 @@ export interface AttemptRecord {
   createdAt: string;
 }
 
+/**
+ * Normalized confirmation receipt stored in receipt_json regardless of
+ * whether the anchor confirmed via direct submit or reconcile. Consumers
+ * always get the same shape.
+ */
+export interface ConfirmationReceipt {
+  txHash: string;
+  ledgerSeq: number;
+  confirmedAt: string;
+  memoHashHex: string;
+}
+
 /** Input to anchor()/reanchor(). */
 export interface AnchorInput {
   proofId: string;
