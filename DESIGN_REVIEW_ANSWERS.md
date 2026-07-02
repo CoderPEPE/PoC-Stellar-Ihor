@@ -247,3 +247,113 @@ Install: `pnpm add --save-dev cross-env`
 Where `.env.testnet` contains `RUN_TESTNET=1`. This avoids any dependency but requires Node >= 20.12. `cross-env` is preferred for broader compatibility and because the POC already has `.env.example` — no second config file needed.
 
 No behavioral change: the flag still gates the integration tests, and `process.env.RUN_TESTNET` in the test file works identically on every platform.
+
+---
+
+# Round 2 — follow-up scenarios
+
+Four scenarios raised after reviewing commit `7e2145b`. Each is now fixed and
+covered by a regression test (`test/anchorService.test.ts` #30–#33; #29 still
+guards the sequence reclaim path).
+
+## R1. Two workers call `syncThenReserve()` with the same on-chain sequence before either inserts its attempt row
+
+### What was wrong
+
+`syncThenReserve` derived the reservation purely from `onChainNext` and the
+live in-flight attempts, and **overwrote** `next_sequence = reserved + 1`. It
+never read the durable counter, so:
+
+- It could roll `next_sequence` **backward** past a value a concurrent `reserve()`
+  had already handed out → the same number issued twice (then `tx_bad_seq` for
+  the loser on-chain).
+- Both `syncThenReserve` and `reserveSequence` ran as better-sqlite3's **default
+  deferred** transactions. A read-then-write deferred transaction takes its write
+  lock late, so a concurrent writer fails with a non-retryable
+  `SQLITE_BUSY_SNAPSHOT` (the `busy_timeout` handler is not invoked) instead of
+  being serialized.
+
+### Fix (`store.ts`)
+
+- Both allocator transactions now run as `BEGIN IMMEDIATE` (`txn.immediate(...)`),
+  so concurrent writers serialize on the write lock rather than throwing.
+- `syncThenReserve` reads the stored `next_sequence` and **never regresses it**:
+  `next = max(reserved + 1, stored)`. A resync may still reserve *below* the
+  counter to reclaim a dead (expired/failed) slot — Stellar needs a gap-free
+  line, so that reclaim is deliberate (see test #29) — but it can no longer clobber
+  a concurrent reserver's increment.
+
+### Honest residual
+
+A *single shared account* under genuinely concurrent rebuilds has an irreducible
+window: a sequence is reserved a tick before its attempt row exists, so a second
+worker reclaiming the same dead slot can pick it too. This is **self-healing** —
+the on-chain loser gets `tx_bad_seq` and `retry()` rebuilds from current chain
+state — and the documented remedy for real concurrency is an **account pool**
+(each account has its own independent sequence line; see `sequence.ts`).
+
+## R2. `retry()` / `reconcile()` on an anchor that is already `superseded`
+
+### What was wrong
+
+A superseded parent still points `active_attempt_id` at its on-chain confirmed
+tx. `reconcile()` would re-find that tx (a re-anchor reuses the same memo),
+re-confirm it via `confirmAndSupersede`, and — because that method writes raw SQL,
+bypassing the `updateAnchor` immutability guard — flip the row `superseded →
+confirmed`, resurrecting a retired generation (two confirmed rows in one lineage).
+
+### Fix (three layers, `anchorService.ts` + `store.ts`)
+
+1. `retry()` returns immediately if the anchor is `superseded`.
+2. `reconcile()` returns immediately if the anchor is `superseded`.
+3. Defense-in-depth at the store: the child UPDATE in `confirmAndSupersede` now
+   carries `WHERE status IN ('pending','submitted')` (cannot regress a terminal
+   row), and the `updateAnchor` immutability guard now treats **superseded** as
+   terminal too — only `confirmed → superseded` and no-ops are allowed out of a
+   terminal state.
+
+## R3. Crash after the attempt is `confirmed` but before `confirmAndSupersede()` completes
+
+### What was wrong
+
+The attempt-confirm (`updateAttempt(..., {status:'confirmed'})`) was a **separate**
+write from `confirmAndSupersede`. A crash between them left attempt=`confirmed`,
+anchor=`submitted` — recoverable via reconcile, but a real (if small) torn window
+the previous commit did not close.
+
+### Fix (`store.ts`)
+
+`confirmAndSupersede` now confirms the **attempt**, the **child anchor**, and the
+**parent supersede** in one transaction. There is no longer any window where the
+attempt is confirmed but the anchor is not. Both confirmation paths
+(`submitAttempt`, `reconcile`) pass the `attemptId` and no longer write the attempt
+status separately.
+
+## R4. Provenance of `memoHashHex` and `confirmedAt`: direct-submit vs reconcile
+
+### What was wrong
+
+The schema was normalized (Round 1 #4), but two fields had **different
+provenance** per path:
+
+| Field | Direct submit (before) | Reconcile |
+|---|---|---|
+| `confirmedAt` | `this.nowIso()` — local clock | `txRecord.createdAt` — ledger close time |
+| `memoHashHex` | `anchor.proofHash` — **assumed**, never verified | read back from chain, gated by `memoMatches` |
+
+Consequence: `proof_mismatch` could only ever be detected by a later reconcile —
+the direct path produced a self-attested receipt while reconcile produced a
+chain-attested one.
+
+### Fix (`horizon.ts`, `horizonReal.ts`, `anchorService.ts`)
+
+The synchronous submit response *is* the included tx resource, so `SubmitResult`
+now carries optional `createdAt` / `memoType` / `memoHashHex`, populated from the
+real Horizon response. On the direct path `submitAttempt` now:
+
+- **Verifies the memo** when the response surfaces it (`res.memoHashHex !==
+  anchor.proofHash → proof_mismatch`), closing the blind spot.
+- Records `confirmedAt = res.createdAt ?? nowIso()` and `memoHashHex =
+  res.memoHashHex ?? anchor.proofHash` — same provenance as reconcile, with the
+  local fallback used only when a client cannot surface those fields (no extra
+  Horizon round-trip).

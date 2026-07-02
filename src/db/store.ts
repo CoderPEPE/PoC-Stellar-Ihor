@@ -53,14 +53,17 @@ export interface Store {
   maxInFlightSequence(accountId: string): string | null;
 
   /**
-   * Atomically confirm a child anchor AND supersede its parent (if any) in one
-   * SQLite transaction. If the process crashes after COMMIT, both effects are
-   * durable; if it crashes before COMMIT, neither is visible. The parent UPDATE
-   * uses `WHERE status='confirmed'` so it is idempotent — a second call that
-   * raced with a concurrent supersede is harmless.
+   * Atomically confirm the active ATTEMPT, confirm the child anchor, AND supersede
+   * its parent (if any) — all in one SQLite transaction. If the process crashes
+   * after COMMIT, all three effects are durable; if it crashes before COMMIT, none
+   * is visible (closing the attempt-confirmed-but-anchor-still-submitted window).
+   * The child UPDATE uses `WHERE status IN ('pending','submitted')` and the parent
+   * UPDATE uses `WHERE status='confirmed'`, so a replay (e.g. reconcile re-running)
+   * can never regress a terminal anchor or double-supersede.
    */
   confirmAndSupersede(
     childId: string,
+    attemptId: string,
     parentId: string | null,
     ledgerSeq: number,
     receiptJson: string,
@@ -68,11 +71,13 @@ export interface Store {
   ): void;
 
   /**
-   * Atomically re-sync the sequence allocator to max(onChainNext, maxInFlight+1)
-   * AND reserve the next sequence number, all inside one SQLite transaction.
-   * This closes the window between resetToChain's SELECT (maxInFlightSequence)
-   * and its UPDATE (setSequence) so a concurrent worker cannot observe an
-   * inconsistent allocator floor.
+   * Atomically re-sync the sequence allocator and reserve the next sequence number,
+   * all inside one BEGIN IMMEDIATE transaction. The reserved value is
+   * max(onChainNext, maxInFlight+1) — the chain's next sequence, lifted above any
+   * sequence a LIVE (pending/submitted) attempt still holds, so a dead (expired/failed)
+   * slot is reclaimed (Stellar needs a gap-free line) but a live one is never reissued.
+   * The durable counter only moves FORWARD: a resync may reserve below it to reclaim a
+   * dead slot, but never rolls it back, so a concurrent reserve()'s increment is not lost.
    */
   syncThenReserve(accountId: string, onChainNext: bigint): string;
 
@@ -255,20 +260,25 @@ export class SqliteStore implements Store {
   }
 
   updateAnchor(anchorId: string, patch: Partial<AnchorRecord>): void {
-    // Immutability guard (defense in depth): once an anchor is confirmed its RECEIPT is
-    // terminal. Allow only confirmed→superseded (re-anchor); never downgrade the status
-    // or overwrite the receipt/ledger/confirmed_at. The error class is intentionally NOT
-    // frozen — a confirmed anchor whose tx later vanishes is flagged testnet_reset_suspected.
+    // Immutability guard (defense in depth): once an anchor reaches a terminal state
+    // (confirmed OR superseded) its RECEIPT is frozen. The only status move allowed out
+    // of a terminal state is confirmed→superseded (re-anchor); a downgrade, or
+    // superseded→confirmed (which would resurrect a retired generation), is dropped.
+    // The error class is intentionally NOT frozen — a confirmed anchor whose tx later
+    // vanishes is flagged testnet_reset_suspected.
     let effective = patch;
     const current = this.getAnchor(anchorId);
-    if (current && current.status === AnchorStatus.Confirmed) {
+    const terminal =
+      current &&
+      (current.status === AnchorStatus.Confirmed || current.status === AnchorStatus.Superseded);
+    if (terminal) {
       effective = { ...patch };
-      if (
-        'status' in effective &&
-        effective.status !== AnchorStatus.Superseded &&
-        effective.status !== AnchorStatus.Confirmed
-      ) {
-        delete effective.status;
+      if ('status' in effective) {
+        const to = effective.status;
+        const ok =
+          to === current.status ||
+          (current.status === AnchorStatus.Confirmed && to === AnchorStatus.Superseded);
+        if (!ok) delete effective.status;
       }
       delete effective.receiptJson;
       delete effective.ledgerSeq;
@@ -399,9 +409,11 @@ export class SqliteStore implements Store {
   }
 
   /**
-   * Reserve the next sequence number atomically. better-sqlite3 is synchronous,
-   * and wrapping the read-then-write in a transaction (BEGIN IMMEDIATE) makes the
-   * allocation safe across concurrent workers/processes sharing the database.
+   * Reserve the next sequence number atomically. better-sqlite3 is synchronous, and
+   * this is a read-then-write transaction — it MUST run as BEGIN IMMEDIATE (.immediate),
+   * not the default deferred mode. A deferred transaction takes its write lock late, so
+   * two concurrent reservers can both read the same snapshot and the loser fails with a
+   * non-retryable SQLITE_BUSY_SNAPSHOT instead of being serialized by busy_timeout.
    */
   reserveSequence(accountId: string): string {
     const txn = this.db.transaction((id: string): string => {
@@ -418,7 +430,7 @@ export class SqliteStore implements Store {
         .run(next, id);
       return reserved.toString();
     });
-    return txn(accountId);
+    return txn.immediate(accountId);
   }
 
   maxInFlightSequence(accountId: string): string | null {
@@ -439,17 +451,25 @@ export class SqliteStore implements Store {
 
   confirmAndSupersede(
     childId: string,
+    attemptId: string,
     parentId: string | null,
     ledgerSeq: number,
     receiptJson: string,
     confirmedAt: string,
   ): void {
     const txn = this.db.transaction(
-      (cId: string, pId: string | null, ls: number, rj: string, ca: string): void => {
+      (cId: string, aId: string, pId: string | null, ls: number, rj: string, ca: string): void => {
+        this.db
+          .prepare(`UPDATE anchor_attempts SET status='confirmed' WHERE attempt_id=?`)
+          .run(aId);
+        // `status IN ('pending','submitted')` makes the child confirm non-regressing:
+        // a replayed confirm on an already-terminal (confirmed/superseded) anchor is a
+        // no-op, so reconcile re-running can never resurrect a superseded generation.
         this.db
           .prepare(
             `UPDATE anchors SET status='confirmed', ledger_seq=?, receipt_json=?,
-                confirmed_at=?, error_class=NULL WHERE anchor_id=?`,
+                confirmed_at=?, error_class=NULL
+                WHERE anchor_id=? AND status IN ('pending','submitted')`,
           )
           .run(ls, rj, ca, cId);
         if (pId !== null) {
@@ -462,11 +482,15 @@ export class SqliteStore implements Store {
         }
       },
     );
-    txn(childId, parentId, ledgerSeq, receiptJson, confirmedAt);
+    txn(childId, attemptId, parentId, ledgerSeq, receiptJson, confirmedAt);
   }
 
   syncThenReserve(accountId: string, onChainNext: bigint): string {
     const txn = this.db.transaction((id: string, chainNext: string): string => {
+      const acct = this.db
+        .prepare('SELECT next_sequence FROM source_accounts WHERE account_id = ?')
+        .get(id) as { next_sequence: string } | undefined;
+      const stored = acct ? BigInt(acct.next_sequence) : 0n;
       const rows = this.db
         .prepare(
           `SELECT sequence_number FROM anchor_attempts
@@ -479,18 +503,20 @@ export class SqliteStore implements Store {
         if (maxLive === null || s > maxLive) maxLive = s;
       }
       const chain = BigInt(chainNext);
-      const floor = maxLive !== null && maxLive + 1n > chain ? maxLive + 1n : chain;
-      const reserved = floor;
-      const next = (reserved + 1n).toString();
+      // Reclaim floor: the chain's next sequence, lifted above any LIVE in-flight one.
+      const reserved = maxLive !== null && maxLive + 1n > chain ? maxLive + 1n : chain;
+      // The durable counter never regresses: a reclaim may reserve below `stored`, but
+      // we keep `stored` if it is already ahead so a concurrent reserve() is not clobbered.
+      const next = reserved + 1n > stored ? reserved + 1n : stored;
       this.db
         .prepare(
           `INSERT INTO source_accounts (account_id, next_sequence) VALUES (?, ?)
            ON CONFLICT (account_id) DO UPDATE SET next_sequence = ?`,
         )
-        .run(id, next, next);
+        .run(id, next.toString(), next.toString());
       return reserved.toString();
     });
-    return txn(accountId, onChainNext.toString());
+    return txn.immediate(accountId, onChainNext.toString());
   }
 
   close(): void {

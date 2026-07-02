@@ -27,12 +27,23 @@ export class RealHorizonClient implements HorizonClient {
     const tx = TransactionBuilder.fromXDR(signedXdr, this.networkPassphrase);
     const res = await this.server.submitTransaction(tx);
     const ledger = Number((res as { ledger?: number | string }).ledger);
+    // The synchronous submit response is the included tx resource — pull the
+    // authoritative memo and ledger-close time off it defensively (the SDK type
+    // doesn't always declare them) so the receipt matches the reconcile provenance.
+    const r = res as unknown as Record<string, unknown>;
+    let memoHashHex: string | null = null;
+    if (r.memo_type === 'hash' && typeof r.memo === 'string') {
+      memoHashHex = Buffer.from(r.memo, 'base64').toString('hex');
+    }
     return {
       hash: res.hash,
       ledger: Number.isFinite(ledger) ? ledger : 0,
       // submitTransaction resolves only on inclusion; treat as successful unless the
       // SDK explicitly says otherwise (never silently coerce a false into a true).
       successful: (res as { successful?: boolean }).successful !== false,
+      createdAt: typeof r.created_at === 'string' ? r.created_at : undefined,
+      memoType: typeof r.memo_type === 'string' ? r.memo_type : undefined,
+      memoHashHex,
     };
   }
 

@@ -697,4 +697,79 @@ describe('AnchorService', () => {
     expect(BigInt(aRebuilt.sequenceNumber)).toBe(BigInt(bAttempt.sequenceNumber) + 1n);
     expect(store.getAttempt(b.activeAttemptId!)!.status).toBe('submitted'); // B untouched
   });
+
+  it('30. reconcile does NOT resurrect a superseded anchor', async () => {
+    const { service, horizon, store } = setup(() => 1000);
+    let ledger = 10;
+    horizon.submitHandler = async (xdr) => ({ hash: hash(xdr), ledger: ++ledger, successful: true });
+    const proofHash = hash('p30');
+
+    const v0 = await service.anchor({ proofId: 'p30', proofHash });
+    const v1 = await service.reanchor(v0.anchorId, 'reset');
+    expect(store.getAnchor(v0.anchorId)!.status).toBe(AnchorStatus.Superseded);
+
+    // v0's tx is still perfectly valid on-chain (same memo — a re-anchor reuses the hash).
+    const v0Tx = store.getAttempt(v0.activeAttemptId!)!.txHash!;
+    horizon.getTransactionHandler = async (h) =>
+      h === v0Tx
+        ? { hash: v0Tx, ledger: 11, successful: true, memoType: 'hash', memoHashHex: proofHash, createdAt: 'now' }
+        : null;
+
+    const after = await service.reconcile(v0.anchorId);
+    expect(after.status).toBe(AnchorStatus.Superseded); // NOT flipped back to confirmed
+    expect(store.getAnchor(v1.anchorId)!.status).toBe(AnchorStatus.Confirmed); // latest stays live
+  });
+
+  it('31. retry on a superseded anchor is a no-op (no resubmit, stays superseded)', async () => {
+    const { service, horizon, store } = setup(() => 1000);
+    let ledger = 20;
+    horizon.submitHandler = async (xdr) => ({ hash: hash(xdr), ledger: ++ledger, successful: true });
+    const proofHash = hash('p31');
+
+    const v0 = await service.anchor({ proofId: 'p31', proofHash });
+    await service.reanchor(v0.anchorId, 'reset');
+    expect(store.getAnchor(v0.anchorId)!.status).toBe(AnchorStatus.Superseded);
+
+    const submitsBefore = horizon.submitCalls;
+    const after = await service.retry(v0.anchorId);
+    expect(after.status).toBe(AnchorStatus.Superseded);
+    expect(horizon.submitCalls).toBe(submitsBefore); // never resubmitted the retired envelope
+  });
+
+  it('32. direct submit catches proof_mismatch when the submit response memo differs', async () => {
+    const { service, horizon } = setup(() => 1000);
+    const proofHash = hash('p32');
+    horizon.submitHandler = async (xdr) => ({
+      hash: hash(xdr),
+      ledger: 5,
+      successful: true,
+      memoType: 'hash',
+      memoHashHex: hash('SOMETHING-ELSE'), // chain memo ≠ our proof hash
+      createdAt: 'now',
+    });
+
+    const a = await service.anchor({ proofId: 'p32', proofHash });
+    expect(a.status).not.toBe(AnchorStatus.Confirmed);
+    expect(a.errorClass).toBe(ErrorClass.ProofMismatch); // caught on the direct path, not only via reconcile
+  });
+
+  it('33. direct submit records chain ledger-time + read-back memo and confirms the attempt atomically', async () => {
+    const { service, store, horizon } = setup(() => 1000);
+    const proofHash = hash('p33');
+    horizon.submitHandler = async (xdr) => ({
+      hash: hash(xdr),
+      ledger: 9,
+      successful: true,
+      memoType: 'hash',
+      memoHashHex: proofHash,
+      createdAt: '2030-01-02T03:04:05Z',
+    });
+
+    const a = await service.anchor({ proofId: 'p33', proofHash });
+    expect(a.status).toBe(AnchorStatus.Confirmed);
+    const receipt = JSON.parse(store.getAnchor(a.anchorId)!.receiptJson!);
+    expect(receipt.confirmedAt).toBe('2030-01-02T03:04:05Z'); // chain time, not the local clock
+    expect(receipt.memoHashHex).toBe(proofHash);
+    expect(store.getAttempt(a.activeAttemptId!)!.status).toBe('confirmed'); // confirmed in the same txn
+  });
 });

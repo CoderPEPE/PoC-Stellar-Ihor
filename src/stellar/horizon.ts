@@ -9,6 +9,18 @@ export interface SubmitResult {
   hash: string;
   ledger: number;
   successful: boolean;
+  /**
+   * Optional authoritative fields from the synchronous submit response (Horizon
+   * returns the included tx resource). When present, the direct-submit path records
+   * the same provenance as reconcile — ledger-close time and the read-back memo —
+   * instead of a local clock and an assumed hash. Clients that can't surface them
+   * leave these undefined and the caller falls back.
+   */
+  createdAt?: string;
+  /** 'hash' | 'text' | 'none' | … (from the submit response, when available). */
+  memoType?: string;
+  /** The memo decoded to hex when memoType === 'hash', else null/undefined. */
+  memoHashHex?: string | null;
 }
 
 export interface TxRecord {

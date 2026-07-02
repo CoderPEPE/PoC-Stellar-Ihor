@@ -118,6 +118,10 @@ export class AnchorService {
     let anchor = this.store.getAnchor(anchorId);
     if (!anchor) throw new Error(`Unknown anchor: ${anchorId}`);
 
+    // A superseded anchor is a retired generation: terminal. Never resubmit or
+    // reconcile it — doing so would re-confirm a tx that has already been replaced.
+    if (anchor.status === AnchorStatus.Superseded) return anchor;
+
     // Idempotent repair: heal torn parent-supersede state from data created
     // before confirmAndSupersede was introduced (defense-in-depth).
     if (anchor.status === AnchorStatus.Confirmed && anchor.parentAnchorId) {
@@ -187,6 +191,9 @@ export class AnchorService {
   async reconcile(anchorId: string): Promise<AnchorRecord> {
     const anchor = this.store.getAnchor(anchorId);
     if (!anchor) throw new Error(`Unknown anchor: ${anchorId}`);
+    // Superseded is terminal: its tx is still on-chain, so re-confirming it here would
+    // resurrect a retired generation. Leave it; the live generation reconciles itself.
+    if (anchor.status === AnchorStatus.Superseded) return anchor;
     const attempt = anchor.activeAttemptId ? this.store.getAttempt(anchor.activeAttemptId) : null;
     if (!attempt || !attempt.txHash) return anchor;
 
@@ -224,15 +231,16 @@ export class AnchorService {
         });
         return this.store.getAnchor(anchorId)!;
       }
-      this.store.updateAttempt(attempt.attemptId, { status: 'confirmed' });
       const receipt: ConfirmationReceipt = {
         txHash: txRecord.hash,
         ledgerSeq: txRecord.ledger,
         confirmedAt: txRecord.createdAt,
         memoHashHex: txRecord.memoHashHex ?? anchor.proofHash,
       };
+      // Attempt-confirm + anchor-confirm + parent-supersede commit together.
       this.store.confirmAndSupersede(
         anchor.anchorId,
+        attempt.attemptId,
         anchor.parentAnchorId,
         receipt.ledgerSeq,
         JSON.stringify(receipt),
@@ -288,7 +296,7 @@ export class AnchorService {
       );
     }
 
-    // The parent is superseded at the child's confirm transition (see supersedeParentOf),
+    // The parent is superseded at the child's confirm transition (see confirmAndSupersede),
     // NOT here — so it works whether the child confirms now, synchronously, or later via
     // retry/reconcile after this submission timed out. Until then the parent stays the
     // live receipt; never retire a live receipt for a generation that doesn't exist yet.
@@ -435,15 +443,25 @@ export class AnchorService {
         });
         return { ok: false, errorClass: ErrorClass.Unknown };
       }
-      this.store.updateAttempt(attempt.attemptId, { status: 'confirmed' });
+      // Integrity check on the direct path too (parity with reconcile): if the submit
+      // response surfaces the on-chain memo, it MUST equal the proof hash. Otherwise the
+      // only place proof_mismatch can be caught is a later reconcile.
+      if (res.memoHashHex != null && res.memoHashHex !== anchor.proofHash) {
+        this.store.updateAnchor(anchor.anchorId, { errorClass: ErrorClass.ProofMismatch });
+        return { ok: false, errorClass: ErrorClass.ProofMismatch };
+      }
       const receipt: ConfirmationReceipt = {
         txHash: res.hash,
         ledgerSeq: res.ledger,
-        confirmedAt: this.nowIso(),
-        memoHashHex: anchor.proofHash,
+        // Prefer the chain's ledger-close time and read-back memo (same provenance as
+        // reconcile); fall back to local values only when the client can't surface them.
+        confirmedAt: res.createdAt ?? this.nowIso(),
+        memoHashHex: res.memoHashHex ?? anchor.proofHash,
       };
+      // Attempt-confirm + anchor-confirm + parent-supersede commit together.
       this.store.confirmAndSupersede(
         anchor.anchorId,
+        attempt.attemptId,
         anchor.parentAnchorId,
         receipt.ledgerSeq,
         JSON.stringify(receipt),

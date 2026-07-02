@@ -74,7 +74,10 @@ reserve() → buildAnchorTx() → claimAndInsertAttempt(CAS) → submitAttempt()
 The signed envelope is persisted before the `submit()` call. If the process crashes after submit but before the response is processed, the exact same envelope can be resubmitted on restart. The network dedupes by transaction hash, so this never double-anchors.
 
 **Expired attempts reclaim sequences.**
-`resetToChain` reads `maxInFlightSequence` which only considers `pending`/`submitted` attempts. An `expired` attempt's sequence falls below the new floor and is reclaimed. No gaps accumulate in the sequence line.
+`syncThenReserve` reserves `max(onChainNext, maxInFlight+1)`, where `maxInFlight` only considers `pending`/`submitted` attempts. An `expired`/`failed` attempt's sequence falls below the floor and is reclaimed — Stellar needs a gap-free line, so reclaim is deliberate. The durable counter never regresses (it may reserve *below* itself to reclaim, but keeps the higher value), so a concurrent `reserve()`'s increment is never lost.
+
+**Allocator transactions are `BEGIN IMMEDIATE`.**
+`reserveSequence` and `syncThenReserve` are read-then-write transactions, so they run as `.immediate()` — a deferred transaction would take its write lock late and let a concurrent writer fail with a non-retryable `SQLITE_BUSY_SNAPSHOT` instead of serializing. A single shared account under concurrent rebuilds still has an irreducible reserve window; it self-heals via `tx_bad_seq` → retry, and the remedy for real concurrency is an account pool.
 
 ---
 
@@ -83,8 +86,15 @@ The signed envelope is persisted before the `submit()` call. If the process cras
 ### Direct submit success
 
 ```
-res.successful === true → attempt→confirmed, anchor→confirmed, supersedeParentOf
+res.successful === true → verify memo (if response surfaces it)
+                        → confirmAndSupersede(attempt, anchor, parent) in ONE txn
 ```
+
+The submit response is the included tx resource, so the direct path records the
+same provenance as reconcile — ledger-close `createdAt` and the read-back
+`memoHashHex` — and verifies the memo (`proof_mismatch` is caught here too, not
+only on reconcile). Local clock / assumed hash are fallbacks for clients that
+can't surface those fields.
 
 ### Reconcile (called via retry)
 
@@ -111,11 +121,15 @@ A single 404 is never enough to declare a testnet reset. Must also see the accou
 **Superseding happens at confirm transition, not at reanchor().**
 `reanchor()` creates a new generation row but never touches the parent's status. Only when the child confirms (via submit OR reconcile) does the parent flip to `superseded`. A re-anchor that times out and confirms later via retry/reconcile still correctly retires its parent. The parent is never retired for a generation that doesn't exist yet.
 
+**A superseded anchor is terminal — never resurrected.**
+`retry()` and `reconcile()` both return immediately on a `superseded` anchor: its tx is still on-chain, so reconciling it would re-confirm a retired generation. Defense-in-depth: `confirmAndSupersede`'s child UPDATE is guarded `WHERE status IN ('pending','submitted')`, and the `updateAnchor` immutability guard treats `superseded` as terminal (only `confirmed → superseded` and no-ops are allowed out of a terminal state).
+
 ---
 
 ## 5. Retry (the repair loop)
 
 ```
+superseded → return (terminal: never resubmit a retired generation)
 reconcile() first (cheap, safe)
   ├── Confirmed/terminal → done
   ├── No attempt or expired/failed → buildAndSubmit({ resync: true })
